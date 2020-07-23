@@ -103,30 +103,40 @@ Feel free to download a Sentinel-2 scene and try it yourself!
 
 ### The fun part
 
-Let's start by importing all the necessary modules. The `pyna` module is a library of functions I have created.
+Let's start by downloading and importing all the necessary modules. The `pyna` module is a library of functions I have created.
 
 
 ```python
-%matplotlib notebook
+# Install missing packages
+!pip install xmltodict
+!pip install git+https://github.com/nargyrop/pyna.git
+```
+
+
+```python
 import warnings
-warnings.simplefilter(action='ignore', category=(DeprecationWarning, FutureWarning))
 
-import os
-import cv2
-import pickle
-import xmltodict
-import tensorflow as tf
-from tensorflow.keras.models import model_from_json
-import folium
-import numpy as np
-import matplotlib.pyplot as plt
-from pyna.rasterlib import Raster
-from pyproj import Proj, transform
-from IPython.display import HTML
-from ipywidgets import *
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", category=FutureWarning)
 
-np.random.seed(42)
-tf.random.set_seed(42)
+    import os
+    import cv2
+    import osr
+    import gdal
+    import folium
+    import pickle
+    import zipfile
+    import xmltodict
+    import numpy as np
+    import tensorflow as tf
+    from ipywidgets import *
+    from IPython.display import HTML
+    from pyna.rasterlib import Raster
+    from pyproj import Proj, transform
+    from tensorflow.keras.models import model_from_json
+
+    np.random.seed(42)
+    tf.random.set_seed(42)
 ```
 
 
@@ -151,29 +161,26 @@ def reproject_coordinates(coord_list, epsg_in):
 
 ```python
 def get_model_parameters(xml_dir, xml_fname):
-    """
-    Function to load model weights and preprocessing parameters.
-    """
+  
     with open(os.path.join(xml_dir, xml_fname)) as fd:
         doc = xmltodict.parse(fd.read())
-    
-    # Not all of the bands might be needed. This is also specified in the filename.
+        xml_item = doc['training_parameters']
+
     bands = list(map(int, doc['training_parameters']['bands'].split(',')))
-    ndvi_cr = doc['training_parameters']['ndvi']
     
-    ndvi_cr = 'True' == True
-    
-    padding = int(doc['training_parameters']['padding'])
-    max_vals = list(map(float, doc['training_parameters']['max_values'].split(',')))  # For normalization
+    max_vals = xml_item.get("max_values", [])
+    if max_vals:
+      max_vals = list(map(float, max_vals.split(',')))
 
-    return bands, ndvi_cr, padding, max_vals
-```
+    mean_vals = xml_item.get("mean_values", [])
+    if mean_vals:
+      mean_vals = list(map(float, mean_vals.split(',')))
 
+    std_vals = xml_item.get("std_values", [])
+    if std_vals:
+      std_vals = list(map(float, std_vals.split(',')))
 
-```python
-def update():
-    """This is needed to update the matplotlib plots"""
-    fig.canvas.draw_idle()
+    return bands, max_vals, mean_vals, std_vals
 ```
 
 
@@ -185,15 +192,32 @@ This is were I'll initialize some required variables, for example the location o
 
 
 ```python
-ziploc = "/home/nikos/Desktop/ml_tests/S2B_MSIL1C_20200410T031539_N0209_R118_T48NUG_20200410T074937.zip"  # target zip file
-req_bands = ("B02", "B03", "B04", "B08", "B8A", "B11", "B12")  # required bands
+ziploc = "/home/nikos/Downloads/S2B_MSIL1C_20200410T031539_N0209_R118_T48NUG_20200410T074937.zip"  # target zip file
+avl_bands = ("B02", "B03", "B04", "B08", "B11", "B12", "B8A")  # available bands
 file_extn = "jp2"  # raster extension
 pixel_size = 10  # target pixel size
 
 xml_mod_dir = '/home/nikos/Desktop/ml_tests/trained_models'  # Directory were the model is stored
-xml_fname = 'unet_2020-06-13_19-39_012345.xml'  # XML that includes preprocessing parameters
+xml_fname = 'unet_2020-07-08_14-05_0123.xml'  # XML that includes preprocessing parameters
 model_fname = xml_fname.replace('xml', 'json')  # Model
 weights_fname = xml_fname.replace('xml', 'h5')  # Model weights
+```
+
+Then, we'll load the preprocessing parameters, model and model weights.
+
+
+```python
+# Get model training parameters
+band_list, max_vals, mean_vals, std_vals = get_model_parameters(xml_mod_dir, xml_fname)
+
+# load json and create model
+json_file = open(os.path.join(xml_mod_dir, model_fname), 'r')
+loaded_model_json = json_file.read()
+json_file.close()
+model = model_from_json(loaded_model_json)
+
+# load weights into new model
+model.load_weights(os.path.join(xml_mod_dir, weights_fname))
 ```
 
 Then, all the required bands are loaded into arrays straight from the zip file. That way we're saving time and disk space. Along with the arrays, we'll get some more data, like the transformation tuple, the projection string and the EPSG code.
@@ -201,7 +225,7 @@ Then, all the required bands are loaded into arrays straight from the zip file. 
 
 ```python
 # Load required bands from S-2 zip file
-band_dict = ro.load_from_zip(ziploc, req_bands, file_extn)
+band_dict = ro.load_from_zip(ziploc, [avl_bands[i] for i in band_list], file_extn)
 ```
 
 
@@ -224,8 +248,12 @@ for band in band_dict.keys():
         transf[1] = pixel_size
         transf[-1] = -pixel_size
         band_dict[band][1] = tuple(transf)
+
+# Get geotransformation tuple and projection
+# Will be used to write georeferenced rasters
 transf = band_dict[dict_keys[0]][1]
 proj = band_dict[dict_keys[0]][2]
+epsg = band_dict[dict_keys[0]][3]
 ```
 
 Now that all the bands have matching pixel sizes, we'll stack them to a single array.
@@ -240,84 +268,49 @@ Since the model required tiles of size (64, 64, 7 (bands)), we'll tile the stack
 
 ```python
 tiled_merged_arr = ro.get_tiles(merged_arr, ksize=64)
-```
-
-Before running the inference, we need to load the model and some preprocessing parameters (normalization values).
-
-
-```python
-# Get model training parameters
-band_list, ndvi_cr, padding, max_vals = get_model_parameters(xml_mod_dir, xml_fname)
-
-# load json and create model
-json_file = open(os.path.join(xml_mod_dir, model_fname), 'r')
-loaded_model_json = json_file.read()
-json_file.close()
-model = model_from_json(loaded_model_json)
-
-# load weights into new model
-model.load_weights(os.path.join(xml_mod_dir, weights_fname))
+tiled_merged_arr = np.squeeze(tiled_merged_arr)
 ```
 
 Then, we'll preprocess the image and have it ready for inference.
 
 
 ```python
-if not tiled_merged_arr.shape[-1] + 1 * ndvi_cr == len(band_list):
-    tiled_merged_arr = tiled_merged_arr[:, :, :, :, :, band_list]
-tiled_merged_arr = np.squeeze(tiled_merged_arr)
-
-# There is the option of also including the NDVI in the bands
-if ndvi_cr:
-    ndvi = np.divide(tiled_merged_arr[:, :, :, :, 3] - tiled_merged_arr[:, :, :, :, 2],
-                     tiled_merged_arr[:, :, :, :, 3] + tiled_merged_arr[:, :, :, :, 2])
-    ndvi = np.nan_to_num(ndvi[:, :, :, :, np.newaxis])
-    tiled_merged_arr = np.concatenate([tiled_merged_arr, ndvi], axis=4)
-    ndvi = None  # Remove from memory
-
 # This is where the normalization happens
-tiled_norm_arr = tiled_merged_arr.astype(np.float32)
-for band in range(tiled_merged_arr.shape[-1]):
-    tiled_norm_arr[:, :, :, :, band] /= max_vals[band]
-
-# We can also apply some padding to each tile, in order to reduce edge effects
-tiled_norm_pad = np.pad(tiled_norm_arr,
-                        ((0, 0), (0, 0), (padding, padding), (padding, padding), (0, 0)), mode='symmetric')
+tiled_merged_arr = tiled_merged_arr.astype(np.float32)
+if max_vals:
+  tiled_merged_arr = np.divide(tiled_merged_arr, max_vals)  # Max normalization
+elif mean_vals and std_vals:
+  tiled_merged_arr = np.divide(tiled_merged_arr - mean_vals, std_vals)  # Standardization
+else:
+    pass  # No processing
 ```
 
 Now we're ready to run the inference!
 
 
 ```python
-tiled_merged_arr, tiled_norm_arr = None, None  # Remove some variables from memory
+# Get the shape of the tile array
+shape = tiled_merged_arr.shape
 
-# Get the number of tiles in each direction, tile size in each direction and number of bands
-ntilesy, ntilesx, sy, sx, nbands = tiled_norm_pad.shape
+# Inference
+predictions = model.predict(tiled_merged_arr.reshape(shape[0] * shape[1],
+                                                     shape[2],
+                                                     shape[3], shape[-1]))
 
-# Reshape the array to stack all tiles along the y-axis
-tiled_reshaped = tiled_norm_pad.reshape(ntilesy * ntilesx, sy + 2 * padding, sx + 2 * padding, nbands)
-tiled_norm_pad = None  # You know what this does by now
+# Reshape to match image size
+predictions = predictions.reshape(shape[:-1])
+inf_arr = np.concatenate(np.concatenate(predictions, axis=1), axis=1)
+```
 
-# Run the inference
-predictions = model.predict(tiled_reshaped)
 
-# Remove the padding if it's been applied
-if padding:
-    predictions = predictions[:, padding:-padding, padding:-padding, :]
-
-# Reshape back to match the original image
-outsl_res = predictions.reshape(ntilesy, ntilesx, sy, sx)
-inf_arr = np.concatenate(np.concatenate(outsl_res, axis=1), axis=1)
-
-predictions, outsl_res, tiled_reshaped, model = None, None, None, None
+```python
+del predictions
 ```
 
 
 ```python
 # Make inference mask a 3D array and add alpha channel. Positives will have red colour
-alpha_ch = np.zeros_like(inf_arr)
-alpha_ch[inf_arr > 0.5] = 255  # We'll make transparent all the pixels with less than 50% probability
-inf_arr = np.dstack((inf_arr * 255, np.zeros_like(inf_arr), inf_arr, alpha_ch)).astype(np.uint8)
+inf_arr = np.dstack((inf_arr * 255, np.zeros_like(inf_arr), inf_arr, inf_arr * 255)).astype(np.uint8)
 ```
 
 Now that the inference is done, we'll display the mask against the RGB image. The Sentinel-2 images are 16-bits. In order to correctly display them with Folium, we'll convert them to 8-bits.
@@ -325,34 +318,34 @@ Now that the inference is done, we'll display the mask against the RGB image. Th
 
 ```python
 rgb_arr = ro.rgb16to8(merged_arr[:, :, [2, 1, 0]]).astype(np.uint8)
-merged_arr = None
+```
+
+
+```python
+del merged_arr; del tiled_merged_arr; del band_dict  # Remove variables to free-up memory
 ```
 
 
 ```python
 # Uncomment the following 2 lines to write NPY files for each image
-np.save(ziploc.replace('.zip', '_pred.npy'), inf_arr)
-np.save(ziploc.replace('.zip', '_rgb.npy'), rgb_arr)
+# np.save(ziploc.replace('.zip', '_pred.npy'), inf_arr)
+# np.save(ziploc.replace('.zip', '_rgb.npy'), rgb_arr)
 
 # Uncomment the following 2 lines to write full-resolution georeferenced rasters
 # ro.write_image(rgb_arr, ziploc.replace('.zip', '_rgb.tif'), transf, proj, )
 # ro.write_image(inf_arr, ziploc.replace('.zip', '_pred.tif'), transf, proj, )
 ```
 
-I'll downsample the RGB image and the mask to 30m, just because the map will be very big to load.
+We could downsample the RGB image and the mask to 20m, to reduce the file size.
 
 
 ```python
-inf_arr = np.load(ziploc.replace('.zip', '_pred.npy'))
-rgb_arr = np.load(ziploc.replace('.zip', '_rgb.npy'))
-```
-
-
-```python
+# Pixel size for the output map
 map_pixel = 20
 
-rgb_arr_res = ro.resample_array(rgb_arr, in_pix=transf[1], out_pix=map_pixel)
-inf_arr_res = ro.resample_array(inf_arr, in_pix=transf[1], out_pix=map_pixel)
+# Resample to target pixel size
+rgb_arr_res = cv2.resize(rgb_arr, (None), fx=(transf[1] / map_pixel), fy=(transf[1] / map_pixel), interpolation=cv2.INTER_NEAREST)
+inf_arr_res = cv2.resize(inf_arr, (None), fx=(transf[1] / map_pixel), fy=(transf[1] / map_pixel), interpolation=cv2.INTER_NEAREST)
 
 # The transformation tuple also needs to be adjusted
 transf = list(transf)
@@ -373,8 +366,7 @@ extents_inf = [(transf[0], transf[3] + inf_arr_res.shape[0] * transf[5]),
 
 
 ```python
-epsg = band_dict[dict_keys[0]][3]  # get the EPSG from any of the bands that have been loaded
-
+# Transform the extents to WGS '84
 transformed_extents_rgb = reproject_coordinates(extents_rgb, epsg)  # Convert RGB image extents to WGS84
 min_lon_rgb, min_lat_rgb = transformed_extents_rgb[0]
 max_lon_rgb, max_lat_rgb = transformed_extents_rgb[1]
@@ -429,7 +421,7 @@ _ = folium.LayerControl().add_to(inf_map)
 
 
 ```python
-inf_map.save("./maps/inference_map.html")  # save to html in order to display it on a webpage
+inf_map.save("./maps/inference_map_20m.html")  # save to html in order to display it on a webpage
 ```
 
 And last, but not least...
@@ -437,7 +429,7 @@ And last, but not least...
 
 ```python
 from IPython.display import IFrame
-IFrame(src='./maps/inference_map.html', width=600, height=600)
+IFrame(src='./maps/inference_map_20m.html', width=600, height=600)
 ```
 
 
@@ -447,7 +439,7 @@ IFrame(src='./maps/inference_map.html', width=600, height=600)
 <iframe
     width="600"
     height="600"
-    src="./maps/inference_map.html"
+    src="./maps/inference_map_20m.html"
     frameborder="0"
     allowfullscreen
 ></iframe>
@@ -455,3 +447,7 @@ IFrame(src='./maps/inference_map.html', width=600, height=600)
 
 
 
+
+```python
+
+```
